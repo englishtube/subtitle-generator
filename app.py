@@ -23,6 +23,10 @@ app.config['VIDEO_UPLOAD_FOLDER'] = VIDEO_UPLOAD_FOLDER
 def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+# Index
+@app.route("/")
+def index():
+    return "Hello EnglishTube Subtitle API!!"
 
 # Subtitle Generator
 @app.route("/subtitle_gen",methods=['POST','GET'])
@@ -245,4 +249,4 @@ def downloadkoreansrt():
 
 
 if __name__ == '__main__':
-  app.run(host='0.0.0.0', port=8080, debug=True)
+  app.run(host='0.0.0.0', debug=True)
