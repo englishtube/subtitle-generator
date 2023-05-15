@@ -1,138 +1,166 @@
-import os
-import ffmpeg
-from pytube import YouTube
-import shutil
-import warnings
-from time import sleep
-from googletrans import Translator
-import backoff
-from typing import Iterator, TextIO
+import speech_recognition as sr
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import jiwer
+from phonemizer.backend import EspeakBackend
 
-location = os.getcwd()
-extracted_audio_dir = "extracted_audio"
-extracted_folder_path = os.path.join(location, extracted_audio_dir)
+# Speech Recognition
+def speechrecg(analysis_audio):
+    r = sr.Recognizer()
+    # load speech file
+    audio_file = sr.AudioFile(analysis_audio)
 
-isExistinput = os.path.exists(extracted_folder_path)
-if(isExistinput == True):
-    shutil.rmtree(extracted_folder_path)
-    os.mkdir(extracted_folder_path)
-elif(isExistinput == False):
-    os.mkdir(extracted_folder_path)
+    # transcribe speech using Google Speech Recognition
+    with audio_file as source:
+        audio = r.record(source)
 
-def download_videos(video_url, video_folder_path):
-    yt = YouTube(video_url)
+    # Recognize speech using Google Cloud Speech
 
-    output = yt.streams.filter(file_extension="mp4").get_by_resolution("720p").download(video_folder_path)
-
-    return output
-
-def format_timestamp(seconds: float, always_include_hours: bool = False):
-    assert seconds >= 0, "non-negative timestamp expected"
-    milliseconds = round(seconds * 1000.0)
-
-    hours = milliseconds // 3_600_000
-    milliseconds -= hours * 3_600_000
-
-    minutes = milliseconds // 60_000
-    milliseconds -= minutes * 60_000
-
-    seconds = milliseconds // 1_000
-    milliseconds -= seconds * 1_000
-
-    hours_marker = f"{hours}:" if always_include_hours or hours > 0 else ""
-    return f"{hours_marker}{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
-
-
-def write_srt(transcript: Iterator[dict], file: TextIO):
-    for i, segment in enumerate(transcript, start=1):
-        print(
-            f"{i}\n"
-            f"{format_timestamp(segment['start'], always_include_hours=True)} --> "
-            f"{format_timestamp(segment['end'], always_include_hours=True)}\n"
-            f"{segment['text'].strip().replace('-->', '->')}\n",
-            file=file,
-            flush=True,
-        )
-
-
-def filename(video_path):
-    return os.path.splitext(os.path.basename(video_path))[0]
-
-
-
-def get_audio(path):
-    audio_paths = {}
-
-    print(f"Extracting audio from {filename(path)}...")
-    output_path = os.path.join(extracted_folder_path, f"{filename(path)}.wav")
-
-    ffmpeg.input(path).output(
-        output_path,
-        acodec="pcm_s16le", ac=1, ar="16k").run(quiet=True) #quiet=True
-
-    audio_paths[path] = output_path
-
-    return audio_paths
-
-def get_subtitles(audio_paths: list, output_srt: bool, output_dir: str, transcribe: callable):
-    subtitles_path = {}
-
-    for path, audio_path in audio_paths.items():
-        srt_path = os.path.join(output_dir, f"English.srt")
+    try:
+        transcribe = r.recognize_google(audio, language="en")
         
-        print(
-            f"Generating subtitles for {filename(path)}... This might take a while."
-        )
+    except sr.UnknownValueError:
+        print("Sorry, I didn't understand what you said")
+    except sr.RequestError as e:
+        print("Could not request results from Google Cloud Speech service; {0}".format(e))
+    return transcribe
 
-        warnings.filterwarnings("ignore")
-        result = transcribe(audio_path)
-        warnings.filterwarnings("default")
+# Get Phonemes
+def phoneme(text):
+    backend = EspeakBackend('en-us', preserve_punctuation=True, with_stress=True)
+    word_list = text.lower()
+    phonemes_list = []
+    text = text.split()
+    phonemized = backend.phonemize(text, strip=True)
+    phonemes_list.extend(phonemized)
+    return(phonemes_list)
 
-        with open(srt_path, "w", encoding="utf-8") as srt:
-            write_srt(result["segments"], file=srt)
+# Word Error Rate
+def wer(input_ref, input_hyp ,debug=False):
+    remove_punctuation = False 
 
-        subtitles_path[path] = srt_path
+    if remove_punctuation == True:
+        ref = jiwer.RemovePunctuation()(input_ref)
+        hyp = jiwer.RemovePunctuation()(input_hyp)
+    else:
+        ref = input_ref
+        hyp = input_hyp
 
-    return subtitles_path[path]
+    r = ref
+    h = hyp
+    #costs will holds the costs, like in the Levenshtein distance algorithm
+    costs = [[0 for inner in range(len(h)+1)] for outer in range(len(r)+1)]
+    # backtrace will hold the operations we've done.
+    # so we could later backtrace, like the WER algorithm requires us to.
+    backtrace = [[0 for inner in range(len(h)+1)] for outer in range(len(r)+1)]
 
-class translator:
-    def __init__(self):
-        self.client = Translator()
-        self.sleep_in_between_translations_seconds = 10
-        self.source_language = "en"
-        self.max_chunk_size = 4000
+    OP_OK = 0
+    OP_SUB = 1
+    OP_INS = 2
+    OP_DEL = 3
 
-    def __createChunks(self, corpus):
-        chunks = [corpus[i:i + self.max_chunk_size] for i in range(0, len(corpus), self.max_chunk_size)]
-        return chunks
+    DEL_PENALTY=1 # Tact
+    INS_PENALTY=1 # Tact
+    SUB_PENALTY=1 # Tact
+    # First column represents the case where we achieve zero
+    # hypothesis words by deleting all reference words.
+    for i in range(1, len(r)+1):
+        costs[i][0] = DEL_PENALTY*i
+        backtrace[i][0] = OP_DEL
 
-    def __sleepBetweenQuery(self):
-        print('Sleeping for {}s after translation query..'.format(self.sleep_in_between_translations_seconds))
-        sleep(self.sleep_in_between_translations_seconds)
+    # First row represents the case where we achieve the hypothesis
+    # by inserting all hypothesis words into a zero-length reference.
+    for j in range(1, len(h) + 1):
+        costs[0][j] = INS_PENALTY * j
+        backtrace[0][j] = OP_INS
 
-    @backoff.on_exception(backoff.expo, Exception, max_tries=150)
-    def Translate(self, content, dest_language_code):
-        try:
-            print('Attempting to translate to lang={}'.format(dest_language_code))
-            if len(content) > self.max_chunk_size:
-                print('Warning: Content is longer than allowed size of {}, breaking into chunks'.format(self.max_chunk_size))
-                results_list = []
-                concatenated_result = ""
-
-                original_chunks = self.__createChunks(content)
-                for i in original_chunks:
-                    r = self.client.translate(i, dest=dest_language_code, src=self.source_language)
-                    self.__sleepBetweenQuery()
-                    results_list.append(r.text)
-
-                for i in results_list:
-                    concatenated_result += i
-
-                return concatenated_result
+    # computation
+    for i in range(1, len(r)+1):
+        for j in range(1, len(h)+1):
+            if r[i-1] == h[j-1]:
+                costs[i][j] = costs[i-1][j-1]
+                backtrace[i][j] = OP_OK
             else:
-                res = self.client.translate(content, dest=dest_language_code, src=self.source_language)
-                self.__sleepBetweenQuery()
-                return res.text
-        except Exception as e:
-            print(e)
-            raise e
+                substitutionCost = costs[i-1][j-1] + SUB_PENALTY # penalty is always 1
+                insertionCost    = costs[i][j-1] + INS_PENALTY   # penalty is always 1
+                deletionCost     = costs[i-1][j] + DEL_PENALTY   # penalty is always 1
+
+                costs[i][j] = min(substitutionCost, insertionCost, deletionCost)
+                if costs[i][j] == substitutionCost:
+                    backtrace[i][j] = OP_SUB
+                elif costs[i][j] == insertionCost:
+                    backtrace[i][j] = OP_INS
+                else:
+                    backtrace[i][j] = OP_DEL
+
+    # back trace though the best route:
+    i = len(r)
+    j = len(h)
+    numSub = 0
+    numDel = 0
+    numIns = 0
+    numCor = 0
+    if debug:
+        lines = []
+        compares = []
+    while i > 0 or j > 0:
+        if backtrace[i][j] == OP_OK:
+            numCor += 1
+            i-=1
+            j-=1
+            if debug:
+                lines.append("OK\t" + r[i]+"\t"+h[j])
+                compares.append(h[j])
+        elif backtrace[i][j] == OP_SUB:
+            numSub +=1
+            i-=1
+            j-=1
+            if debug:
+                lines.append("SUB\t" + r[i]+"\t"+h[j])
+                compares.append(h[j] +  r[i])
+        elif backtrace[i][j] == OP_INS:
+            numIns += 1
+            j-=1
+            if debug:
+                lines.append("INS\t" + "****" + "\t" + h[j])
+                compares.append(h[j])
+        elif backtrace[i][j] == OP_DEL:
+            numDel += 1
+            i-=1
+            if debug:
+                lines.append("DEL\t" + r[i]+"\t"+"****")
+                compares.append(r[i])
+    if debug:
+        compares = reversed(compares)
+        for line in compares:
+            print(line, end=" ")
+        
+    wer_result = round( (numSub + numDel + numIns) / (float) (len(r)), 3)
+    return {'WER':wer_result, 'Cor':numCor, 'Sub':numSub, 'Ins':numIns, 'Del':numDel}, compares
+
+# Sentiment Analysis score and pronounciation score
+def pronoun_score(transcribe,cwr):
+    sa_obj = SentimentIntensityAnalyzer() 
+    polarity_dict = sa_obj.polarity_scores(transcribe) 
+
+    print("Raw sentiment dictionary : ", polarity_dict) 
+    print("polarity percentage of sentence ", polarity_dict['neg']*100, "% :: Negative") 
+    print("polarity percentage of sentence ", polarity_dict['neu']*100, "% :: Neutral") 
+    print("polarity percentage of sentence ", polarity_dict['pos']*100, "% :: Positive") 
+
+    if polarity_dict['pos'] > polarity_dict['neg'] and polarity_dict['pos'] > polarity_dict['neu']:
+      print("Positive : ", polarity_dict['pos'])
+      pos = polarity_dict['pos']
+      pronouciation_score = ((pos + cwr) / 2)
+      print("Pronouciation Score: {0:.2f}".format(pronouciation_score))
+
+    elif polarity_dict['neg'] > polarity_dict['pos'] and polarity_dict['neg'] > polarity_dict['neu']:
+      print("Negative : ", polarity_dict['neg'])
+      neg = polarity_dict['neg']
+      pronouciation_score = ((neg + cwr) / 2)
+      print("Pronouciation Score: {0:.2f}".format(pronouciation_score))
+    else :
+      print("Neutral : ", polarity_dict['neu'])
+      neu = polarity_dict['neu']
+      pronouciation_score = ((neu + cwr) / 2)
+      print("Pronouciation Score: {0:.2f}".format(pronouciation_score))
+    return pronouciation_score
